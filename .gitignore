@@ -1,0 +1,5 @@
+yolov8n.pt
+runs/detect
+cardnet_1.pth
+cardnet.pth
+__pycache__
