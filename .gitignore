@@ -3,3 +3,4 @@ runs/detect
 cardnet_1.pth
 cardnet.pth
 __pycache__
+card_classifier.py

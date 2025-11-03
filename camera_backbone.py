@@ -1,89 +1,125 @@
+from ultralytics import YOLO
 import cv2
-import os
-import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
-from torchvision import models
-from PIL import Image
-import card_classifier
-#from card_classifier import CardNet
+import supervision as sv  # for tracking
+import time
 import numpy as np
 
 
-class_names = ['ace', 'two', 'three', 'four', 'five', 'six', 'seven', 
-               'eight', 'nine', 'ten', 'jack', 'queen', 'king', 'joker']
-idx2label = {i: class_name for i, class_name in enumerate(class_names)}
+model = YOLO(r"runs\detect\train5\weights\best.pt")
 
+# Initialize tracker
+tracker = sv.ByteTrack(
+    track_activation_threshold=0.5,
+    lost_track_buffer=50,
+    minimum_matching_threshold=0.7,
+    frame_rate=30
+)
 
-num_classes = 14
-model = models.resnet18(weights='IMAGENET1K_V1')
-model.fc = nn.Linear(model.fc.in_features, num_classes)
-model.load_state_dict(torch.load('cardnet_1.pth', map_location='cuda'))
-model.eval()
-
-
-
-transform = transforms.Compose([
-    transforms.Resize((128, 128)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5],
-                         [0.5, 0.5, 0.5])
-])
-
-
-cap = cv2.VideoCapture(1)
-
-#test for capture
-ret, frame = cap.read()
-print(ret, frame.shape)
-
-card_values = {
-    'two': +1, 'three': +1, 'four': +1, 'five': +1, 'six': +1,
-    'seven': 0, 'eight': 0, 'nine': 0,
-    'ten': -1, 'jack': -1, 'queen': -1, 'king': -1, 'ace': -1
+# Hi-Lo count mapping
+HI_LO = {
+    '2': 1, '3': 1, '4': 1, '5': 1, '6': 1,
+    '7': 0, '8': 0, '9': 0,
+    '10': -1, 'j': -1, 'q': -1, 'k': -1, 'a': -1
 }
 
 running_count = 0
+seen_cards = {}  # track_id -> card label
+card_positions = {}
+COOLDOWN_TIME = 5.0
+MIN_CONFIDENCE = 0.5
+
+
+def get_rank(label):
+    label = label.lower()
+    if label.startswith("10"):
+        return "10"
+    return label[0] 
+
+def is_duplicate_card(xyxy, label, threshold=80):
+    """Check if this detection is too close to an existing counted card within cooldown period"""
+    center_x = (xyxy[0] + xyxy[2]) / 2
+    center_y = (xyxy[1] + xyxy[3]) / 2
+    current_time = time.time()
+    
+    # Clean up old positions that are outside cooldown period
+    expired_tracks = []
+    for track_id, pos_info in card_positions.items():
+        stored_x, stored_y, stored_label, timestamp = pos_info
+        if current_time - timestamp > COOLDOWN_TIME:
+            expired_tracks.append(track_id)
+    
+    for track_id in expired_tracks:
+        del card_positions[track_id]
+    
+    # Check remaining positions for duplicates
+    for pos_info in card_positions.values():
+        stored_x, stored_y, stored_label, timestamp = pos_info
+        distance = np.sqrt((center_x - stored_x)**2 + (center_y - stored_y)**2)
+        
+        # If same card type is very close and within cooldown period, likely duplicate
+        if distance < threshold and stored_label == label:
+            time_since_count = current_time - timestamp
+            if time_since_count < COOLDOWN_TIME:
+                return True
+    return False
+
+cap = cv2.VideoCapture(1)
+fps_start = time.time()
+
+frames = 0
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    #card ROI (for now, manually hold card in center)
-    h, w, _ = frame.shape
-    size = 200
-    cx, cy = w // 2, h // 2
-    x1, y1 = cx - size//2, cy - size//2
-    x2, y2 = cx + size//2, cy + size//2
-    roi = frame[y1:y2, x1:x2]
+    results = model(frame)
+    detections = sv.Detections.from_ultralytics(results[0])
 
-    #image tensor
-    img_pil = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-    image = transform(img_pil).unsqueeze(0)
+    high_conf_mask = detections.confidence >= MIN_CONFIDENCE
+    detections = detections[high_conf_mask]
 
-    #class prediction
-    with torch.no_grad():
-        output = model(image)
-        probs = torch.softmax(output, dim=1)
-        pred_idx = torch.argmax(probs).item()
-        label = idx2label[pred_idx]
-        confidence = probs[0, pred_idx].item()
+    tracked = tracker.update_with_detections(detections)
 
-    if confidence > 0.8:
-        running_count += card_values[label]
+    for xyxy, conf, cls_id, track_id in zip(tracked.xyxy, tracked.confidence, tracked.class_id, tracked.tracker_id):
+        x1, y1, x2, y2 = map(int, xyxy)
+        label = model.names[int(cls_id)]
+        rank = get_rank(label)
 
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    cv2.putText(frame, f"Card: {label} ({confidence*100:.1f}%)",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-    cv2.putText(frame, f"Count: {running_count}",
-                (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+        # Only count once per track ID
+        if (track_id not in seen_cards and not is_duplicate_card(xyxy, label) and conf >= MIN_CONFIDENCE):
+            seen_cards[track_id] = label
 
-    cv2.imshow('Card Counter', frame)
+            center_x = (xyxy[0] + xyxy[2]) / 2
+            center_y = (xyxy[1] + xyxy[3]) / 2
+            current_time = time.time()
+            card_positions[track_id] = (center_x, center_y, label, current_time)
 
-    key = cv2.waitKey(1)
-    if key == ord('q'):
+            running_count += HI_LO.get(rank, 0)
+
+        # Draw box + label
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f"{label} ({conf:.2f})", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    # Calculate FPS
+    frames += 1
+    if frames % 10 == 0:
+        fps = frames / (time.time() - fps_start)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+    # Display running count
+    cv2.putText(frame, f"Count: {running_count}", (10, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    cv2.imshow("Card Counter (YOLOv8)", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
+    if cv2.waitKey(1) & 0xFF == ord('r'):
+        seen_cards.clear()
+        running_count = 0
+        print("Count reset!")
 
 cap.release()
 cv2.destroyAllWindows()
